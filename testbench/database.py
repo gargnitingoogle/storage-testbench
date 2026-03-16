@@ -56,6 +56,12 @@ class Database:
         self._retry_tests = retry_tests
         self._supported_methods = supported_methods
 
+        self._folders_lock = threading.RLock()
+        self._folders = {}
+
+        self._storage_layouts_lock = threading.RLock()
+        self._storage_layouts = {}
+
         self._projects_lock = threading.RLock()
         self._projects = {}
 
@@ -76,6 +82,10 @@ class Database:
             self._rewrites = {}
         with self._retry_tests_lock:
             self._retry_tests = {}
+        with self._folders_lock:
+            self._folders = {}
+        with self._storage_layouts_lock:
+            self._storage_layouts = {}
         # The list of supported methods for `retry_test` is defined via flask
         # decorators, it should remain unchanged after the test or application
         # is initialized. Arguably this means it should be in a global variable.
@@ -621,6 +631,69 @@ class Database:
             return self._projects.setdefault(
                 project_id, gcs.project.GcsProject(project_id)
             )
+
+    # ==== FOLDERS ==== #
+
+    def __folder_key(self, bucket_name, folder_id):
+        return f"{bucket_name}/{folder_id}"
+
+    def get_folder(self, bucket_name, folder_id, context):
+        with self._folders_lock:
+            key = self.__folder_key(bucket_name, folder_id)
+            folder = self._folders.get(key)
+            if folder is None:
+                return testbench.error.notfound("Folder %s" % key, context)
+            return folder
+
+    def insert_folder(self, bucket_name, folder, context):
+        with self._folders_lock:
+            # Folder ID is part of the name: projects/_/buckets/{bucket}/folders/{folder_id}
+            # We assume the caller parses this.
+            # folder.name is the full resource name.
+            key = self.__folder_key(bucket_name, folder.name.split("/")[-1])
+            if key in self._folders:
+                return testbench.error.already_exists(context)
+            self._folders[key] = folder
+
+    def delete_folder(self, bucket_name, folder_id, context):
+        with self._folders_lock:
+            key = self.__folder_key(bucket_name, folder_id)
+            if key not in self._folders:
+                return testbench.error.notfound("Folder %s" % key, context)
+            del self._folders[key]
+
+    def rename_folder(self, bucket_name, old_folder_id, new_folder_id, context):
+        with self._folders_lock:
+            old_key = self.__folder_key(bucket_name, old_folder_id)
+            new_key = self.__folder_key(bucket_name, new_folder_id)
+
+            folder = self._folders.get(old_key)
+            if folder is None:
+                return testbench.error.notfound("Folder %s" % old_key, context)
+
+            if new_key in self._folders:
+                return testbench.error.already_exists(context)
+
+            # Update the folder name
+            folder.name = folder.name.replace(old_folder_id, new_folder_id)
+            self._folders[new_key] = folder
+            del self._folders[old_key]
+            return folder
+
+    # ==== STORAGE LAYOUTS ==== #
+
+    def get_storage_layout(self, bucket_name, context):
+        with self._storage_layouts_lock:
+            # Create a default layout if one doesn't exist
+            # This mimics the behavior where every bucket has a layout
+            if bucket_name not in self._storage_layouts:
+                # We need to import the proto here or pass it in.
+                # For now, let's just return a dict or object that the caller can use.
+                # Actually, the caller (servicer) will likely construct the proto.
+                # Here we just store the "state" which might include custom settings.
+                # For now, let's assume default layout.
+                pass
+            return self._storage_layouts.get(bucket_name)
 
     # ==== RETRY_TESTS ==== #
 

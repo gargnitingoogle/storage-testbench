@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import base64
+from collections.abc import Iterable
+from concurrent import futures
 import copy
 import datetime
 import functools
@@ -20,26 +22,26 @@ import itertools
 import json
 import re
 import sys
+from threading import Timer
 import types
 import uuid
-from collections.abc import Iterable
-from concurrent import futures
-from threading import Timer
 
 import crc32c
+import gcs
+from google.iam.v1 import iam_policy_pb2
+from google.protobuf import field_mask_pb2, json_format, text_format
 import google.protobuf.any_pb2 as any_pb2
 import google.protobuf.descriptor as pb_descriptor
 import google.protobuf.empty_pb2 as empty_pb2
 import google.protobuf.message as pb_message
-import grpc
-from google.protobuf import field_mask_pb2, json_format, text_format
 from google.rpc import status_pb2
-from grpc_status import rpc_status
-
-import gcs
-import testbench
-from google.iam.v1 import iam_policy_pb2
+from google.storage.control.v2 import storage_control_pb2, storage_control_pb2_grpc
 from google.storage.v2 import storage_pb2, storage_pb2_grpc
+import grpc
+from grpc_status import rpc_status
+import testbench
+from google.storage.control.v2 import storage_control_pb2, storage_control_pb2_grpc
+
 
 _GRPC_SERVER_THREAD_COUNT = 2
 
@@ -100,8 +102,7 @@ def _format_output_generator(name, id, generator):
 
 
 def _logging_method_decorator(function):
-    """
-    Log the request and response from an RPC, returning the response.
+    """Log the request and response from an RPC, returning the response.
 
     Returning the response makes the code more succint at the call site, without
     much loss of readability.
@@ -141,8 +142,8 @@ def _logging_method_decorator(function):
 
 
 def _metadata_echo_decorator(function):
-    """
-    Send back the invocation metadata as initial metadata, if metadata echo is
+    """Send back the invocation metadata as initial metadata, if metadata echo is
+
     enabled.
     """
 
@@ -210,8 +211,8 @@ def _validate_object_contexts(contexts, grpc_context):
 
 
 def retry_test(method):
-    """
-    Decorate a routing function to handle the Retry Test API instructions,
+    """Decorate a routing function to handle the Retry Test API instructions,
+
     with method names based on the JSON API.
     """
 
@@ -993,7 +994,11 @@ class StorageServicer(storage_pb2_grpc.StorageServicer):
     def RestoreObject(self, request, context):
         preconditions = testbench.common.make_grpc_preconditions(request)
         blob = self.db.restore_object(
-            request.bucket, request.object, request.generation, preconditions, context
+            request.bucket,
+            request.object,
+            request.generation,
+            preconditions,
+            context,
         )
         return blob.metadata
 
@@ -1045,7 +1050,12 @@ class StorageServicer(storage_pb2_grpc.StorageServicer):
                 return testbench.error.missing("finish_write in request", context)
             return storage_pb2.WriteObjectResponse(persisted_size=len(upload.media))
         blob, _ = gcs.object.Object.init(
-            upload.request, upload.metadata, upload.media, upload.bucket, False, context
+            upload.request,
+            upload.metadata,
+            upload.media,
+            upload.bucket,
+            False,
+            context,
         )
         upload.blob = blob
         self.db.insert_object(
@@ -1163,12 +1173,124 @@ class StorageServicer(storage_pb2_grpc.StorageServicer):
         return storage_pb2.QueryWriteStatusResponse(persisted_size=len(upload.media))
 
 
+@decorate_all_rpc_methods
+class StorageControlServicer(storage_control_pb2_grpc.StorageControlServicer):
+    """Implements the google.storage.control.v2.StorageControl gRPC service."""
+
+    def __init__(self, db, echo_metadata=False):
+        self.db = db
+        self.echo_metadata = echo_metadata
+        # Register supported methods for retry tests
+        self.db.insert_supported_methods(
+            [
+                "storage.folders.get",
+                "storage.folders.create",
+                "storage.folders.delete",
+                "storage.folders.rename",
+                "storage.storage_layout.get",
+            ]
+        )
+
+    def _parse_folder_name(self, folder_name, context):
+        # Expected: projects/{project}/buckets/{bucket}/folders/{folder_id}
+        # But folder_id can contain slashes.
+        # Regex: projects/([^/]+)/buckets/([^/]+)/folders/(.+)
+        match = re.match(r"projects/([^/]+)/buckets/([^/]+)/folders/(.+)", folder_name)
+        if not match:
+            testbench.error.invalid("Invalid folder name %s" % folder_name, context)
+        return match.group(1), match.group(2), match.group(3)
+
+    def _parse_bucket_name(self, resource_name, context):
+        # Expected: projects/{project}/buckets/{bucket}
+        match = re.match(r"projects/([^/]+)/buckets/([^/]+)$", resource_name)
+        if not match:
+            testbench.error.invalid("Invalid bucket name %s" % resource_name, context)
+        return match.group(1), match.group(2)
+
+    @retry_test(method="storage.folders.create")
+    def CreateFolder(self, request, context):
+        project, bucket = self._parse_bucket_name(request.parent, context)
+        # request.folder.name is just the ID usually in create?
+        # No, CreateFolderRequest has parent and folder_id, and the folder object.
+        # The folder object name might be empty or ignored?
+        # The doc says: "The full name of the folder, including the parent bucket."
+        # But usually in Create, the ID is separate.
+        # request.folder_id is required.
+
+        folder_id = request.folder_id
+        if not folder_id:
+            testbench.error.missing("folder_id", context)
+
+        full_name = f"{request.parent}/folders/{folder_id}"
+        request.folder.name = full_name
+
+        # We need to verify the bucket exists?
+        # Normalize to projects/_/buckets/{bucket} for lookup as testbench stores it that way
+        bucket_resource_name = f"projects/_/buckets/{bucket}"
+        self.db.get_bucket(bucket_resource_name, context)
+
+        self.db.insert_folder(bucket, request.folder, context)
+        return request.folder
+
+    @retry_test(method="storage.folders.delete")
+    def DeleteFolder(self, request, context):
+        project, bucket, folder_id = self._parse_folder_name(request.name, context)
+        self.db.delete_folder(bucket, folder_id, context)
+        return empty_pb2.Empty()
+
+    @retry_test(method="storage.folders.get")
+    def GetFolder(self, request, context):
+        project, bucket, folder_id = self._parse_folder_name(request.name, context)
+        return self.db.get_folder(bucket, folder_id, context)
+
+    @retry_test(method="storage.folders.rename")
+    def RenameFolder(self, request, context):
+        project, bucket, folder_id = self._parse_folder_name(request.name, context)
+
+        # New folder ID is just the ID, but we need to construct the full name?
+        # RenameFolderRequest has destination_folder_id.
+        new_folder_id = request.destination_folder_id
+        if not new_folder_id:
+            testbench.error.missing("destination_folder_id", context)
+
+        folder = self.db.rename_folder(bucket, folder_id, new_folder_id, context)
+        return folder
+
+    @retry_test(method="storage.storage_layout.get")
+    def GetStorageLayout(self, request, context):
+        # name: projects/{project}/buckets/{bucket}/storageLayout
+        match = re.match(
+            r"projects/([^/]+)/buckets/([^/]+)/storageLayout", request.name
+        )
+        if not match:
+            testbench.error.invalid(
+                "Invalid storage layout name %s" % request.name, context
+            )
+        project, bucket = match.group(1), match.group(2)
+
+        layout = self.db.get_storage_layout(bucket, context)
+        if layout is None:
+            # Return default layout
+            layout = storage_control_pb2.StorageLayout(
+                name=request.name,
+                location="us-central1",  # Default?
+                location_type="region",
+                hierarchical_namespace=storage_control_pb2.StorageLayout.HierarchicalNamespace(
+                    enabled=False
+                ),
+            )
+        return layout
+
+
 def run(port, database, echo_metadata=False):
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=_GRPC_SERVER_THREAD_COUNT)
     )
     storage_pb2_grpc.add_StorageServicer_to_server(
         StorageServicer(database, echo_metadata), server
+    )
+    storage_control_pb2_grpc.add_StorageControlServicer_to_server(
+        StorageControlServicer(database, echo_metadata), server
     )
     port = server.add_insecure_port("0.0.0.0:%d" % port)
     server.start()
